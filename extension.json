@@ -1,0 +1,22 @@
+{
+    "name": "ArtScan",
+    "command_name": "ascan",
+    "version": "1.0",
+    "extension_author": "artex",
+    "original_author": "artex",
+    "repo_url": "https://github.com/art3x/ascan_sliver",
+    "help": "Tiny and fast port scanner",
+    "entrypoint": "Execute",
+    "files": [
+        {
+            "os": "windows",
+            "arch": "386",
+            "path": "ascan.x86.dll"
+        },
+        {
+            "os": "windows",
+            "arch": "amd64",
+            "path": "ascan.x64.dll"
+        }
+    ]
+}
