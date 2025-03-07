@@ -21,6 +21,7 @@ Output* output = NULL;
 
 // Global configuration variables (with defaults)
 int g_threadLimit = 20; // default number of concurrent threads
+static int g_ctimeout = 100; // port scan timeout in msec (default: 100)
 int g_rechecks = 0;     // default extra rechecks if a port is closed
 
 // Globals for ping functionality:
@@ -309,7 +310,7 @@ int scan_port(const char* ip, int port, int ipIndex) {
         struct sockaddr_in server;
         char buffer[1024];
         int result;
-        int ctimeout = 100; // milliseconds timeout
+        int ctimeout = g_ctimeout; // use configurable timeout
         fd_set writefds;
         struct timeval tv;
 
@@ -700,6 +701,7 @@ int Execute(char* argsBuffer, uint32_t bufferSize, goCallback callback) {
     output = NewOutput(128, callback);
 
     g_threadLimit = 20; // default number of concurrent threads
+    g_ctimeout = 100; // port scan timeout in msec (default: 100)
     g_rechecks = 0;     // default extra rechecks if a port is closed
     g_pingEnabled = 1;  // if nonzero, perform ping check (default ON)
     g_isPingOnly = 0;   // if nonzero, perform ping-only scan
@@ -711,28 +713,36 @@ int Execute(char* argsBuffer, uint32_t bufferSize, goCallback callback) {
     append(output, "|     |  _|  _|__   |  _| .'|   |\n");
     append(output, "|__|__|_| |_| |_____|___|__,|_|_|\n");
     append(output, "\033[32m");
-    append(output, "ArtScan by @art3x\033[0m         ver 1.0\n");
+    append(output, "ArtScan by @art3x\033[0m         ver 1.1\n");
 
     if (bufferSize < 1) {
-        append(output, "[!] Usage: <ipRange> [portRange] [-t threadLimit] [-r rechecks] [-Pn] [-i] [-Nb] [-h]\n");
+        append(output, "[!] Usage: <ipRange> [portRange] [-T threadLimit] [-t timeout] [-r rechecks] [-Pn] [-i] [-Nb] [-h]\n");
         return failure(output);
     }
 
-    char buf[512] = { 0 };
-    strncpy(buf, argsBuffer, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char* buf = (char*)malloc(bufferSize + 1); // +1 to null-terminate
+    if (buf == NULL) {
+        append(output, "[!] Memory allocation error.\n");
+        return failure(output);
+    }
+
+    memcpy(buf, argsBuffer, bufferSize);
+    buf[bufferSize] = '\0'; // explicitly null-terminate
+
+    // Remove trailing CRLF
     buf[strcspn(buf, "\r\n")] = '\0';
 
     // Check if help is requested.
     if (strcmp(buf, "-h") == 0 || strstr(buf, " -h") != NULL) {
-        append(output, "Usage: <ipRange> [portRange] [-t threadLimit] [-r rechecks] [-Pn] [-i] [-Nb] [-h]\n");
+        append(output, "Usage: <ipRange> [portRange] [-T threadLimit] [-t timeout] [-r rechecks] [-Pn] [-i] [-Nb] [-h]\n");
         append(output, "  ipRange:   Single IP or range (e.g., 192.168.1.1-100 or 192.168.1.1-192.168.1.100)\n");
         append(output, "  portRange: Single port, range (80-90), or comma-separated list (22,80,443)\n");
-        append(output, "  -t:        Set thread limit (default: 20, max: 40)\n");
-        append(output, "  -r:        Set extra rechecks for unanswered ports (default: 1, max: 10)\n");
+        append(output, "  -T:        Set thread limit (default: 20, max: 50)\n");
+        append(output, "  -t:        Set port scan timeout in msec (default: 100)\n");
+        append(output, "  -r:        Set extra rechecks for unanswered ports (default: 0, max: 10)\n");
         append(output, "  -Pn:       Disable ping (skip host availability check)\n");
         append(output, "  -i:        Perform ping scan only (skip port scan)\n");
-        append(output, "  -Nb:       Enable NetBIOS name lookup\n");
+        append(output, "  -Nb:       Enable hostname resolution during ICMP (like ping -a)\n");
         append(output, "  -h:        Display this help message\n");
         return success(output);
     }
@@ -750,15 +760,25 @@ int Execute(char* argsBuffer, uint32_t bufferSize, goCallback callback) {
     char* token = NULL;
     while ((token = strtok(NULL, " ")) != NULL) {
         if (token[0] == '-') {
-            if (strncmp(token, "-t", 2) == 0) {
+            if (strncmp(token, "-T", 2) == 0) {
                 const char* valueStr = token + 2;
                 if (*valueStr == '\0') {
                     valueStr = strtok(NULL, " ");
                 }
                 if (valueStr)
                     g_threadLimit = atoi(valueStr);
-                if (g_threadLimit > 40 || g_threadLimit < 1)
-                    g_threadLimit = 40;
+                if (g_threadLimit > 50 || g_threadLimit < 1)
+                    g_threadLimit = 50;
+            }
+            else if (strncmp(token, "-t", 2) == 0) {
+                const char* valueStr = token + 2;
+                if (*valueStr == '\0') {
+                    valueStr = strtok(NULL, " ");
+                }
+                if (valueStr)
+                    g_ctimeout = atoi(valueStr);
+                if (g_ctimeout < 10) g_ctimeout = 10; // set a reasonable minimum
+                if (g_ctimeout > 10000) g_ctimeout = 10000; // set a reasonable max
             }
             else if (strncmp(token, "-r", 2) == 0) {
                 const char* valueStr = token + 2;
@@ -787,7 +807,7 @@ int Execute(char* argsBuffer, uint32_t bufferSize, goCallback callback) {
                 int j = 0;
                 // Copy characters as long as they are digits or '-'
                 for (int i = 0; token[i] != '\0' && j < (int)sizeof(filtered) - 1; i++) {
-                    if (isdigit((unsigned char)token[i]) || token[i] == '-') {
+                    if (isdigit((unsigned char)token[i]) || token[i] == '-' || token[i] == ',') {
                         filtered[j++] = token[i];
                     }
                     else {
@@ -811,27 +831,30 @@ int Execute(char* argsBuffer, uint32_t bufferSize, goCallback callback) {
     else {
         // If no port range is provided, default to a common port list.
         if (portRange == NULL) {
-            portRange = _strdup("20,21,22,23,25,53,80,88,110,111,135,139,143,389,443,445,464,593,636,993,995,1194,1433,1494,1521,1666,1801,1812,1813,2049,2179,2383,2598,3000,3268,3269,3306,3389,4172,4444,4848,5000,5044,5060,5061,5432,5555,5601,5671,5672,5900,5938,5984,5985,5986,6160,6379,6602,7001,7474,7687,7777,7990,7999,8080,8081,8082,8086,8090,8091,8200,8443,8500,8529,8530,8531,8600,8888,8912,9000,9042,9080,9090,9092,9160,9200,9300,9389,9443,9990,9999,10011,10050,10051,11211,15672,27017,29418,30033,47001,50000");
+            portRange = _strdup("20,21,22,23,25,53,65,66,69,80,88,110,111,135,139,143,194,389,443,445,464,465,587,593,636,993,995,1194,1433,1494,1521,1540,1666,1801,1812,1813,2049,2179,2222,2383,2598,3000,3268,3269,3306,3333,3389,4444,4848,5000,5044,5060,5061,5432,5555,5601,5631,5666,5671,5672,5693,5900,5931,5938,5984,5985,5986,6160,6200,6379,6443,6600,6771,7001,7474,7687,7777,7990,8000,8006,8080,8081,8082,8086,8088,8090,8091,8200,8443,8444,8500,8529,8530,8531,8600,8888,8912,9000,9042,9080,9090,9092,9160,9200,9300,9389,9443,9999,10000,10001,10011,10050,10051,11211,15672,17990,27015,27017,30033,47001");
             isNoPorts = 1;
         }
         g_isPingOnly = 0;
     }
 
-    append(output, "\033[97m[.] Scanning IP(s): %s\033[0m\n", targetRange);
+    append(output, "\033[97m");
+    append(output, "[.] Scanning IP(s): %s\n", targetRange);
     if (!g_isPingOnly)
         if (!isNoPorts)
-            append(output, "\033[97m[.] PORT(s): %s\033[0m\n", portRange);
+            append(output, "[.] PORT(s): %s\n", portRange);
         else
-            append(output, "\033[97m[.] PORT(s): TOP 100\033[0m\n");
+            append(output, "[.] PORT(s): TOP 120\n");
     else
-        append(output, "\033[97m[.] Ping-only scan mode\033[0m\n");
-    append(output, "\033[97m[.] Threads: %d   Rechecks: %d\033[0m\n", g_threadLimit, g_rechecks);
+        append(output, "[.] Ping-only scan mode\n");
+    append(output, "[.] Threads: %d   Rechecks: %d   Timeout: %d\n", g_threadLimit, g_rechecks, g_ctimeout);
     if (!g_pingEnabled)
-        append(output, "\033[97m[.] Ping disabled (-Pn flag used)\033[0m\n");
-
+        append(output, "[.] Ping disabled (-Pn flag used)\n");
+    append(output, "\033[0m");
+        
     // run_port_scan() will perform the ping scan and, if not in ping-only mode, the port scan.
     run_port_scan(targetRange, portRange);
 
+    free(buf);
     // Free allocated portRange.
     if (portRange != NULL) {
         free(portRange);
